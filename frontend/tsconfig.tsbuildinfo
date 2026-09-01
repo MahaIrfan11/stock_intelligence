@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/types.ts","./src/api/client.ts","./src/components/DuplicateDialog.tsx","./src/components/Opportunities.tsx","./src/components/StatTiles.tsx","./src/components/StockFilters.tsx","./src/components/StockForm.tsx","./src/components/StockTable.tsx","./src/components/Toast.tsx","./src/hooks/useDebounce.ts"],"version":"5.9.3"}
