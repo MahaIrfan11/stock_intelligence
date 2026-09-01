@@ -1,28 +1,44 @@
-# Extension — Ingesting supplier spreadsheets and emails at scale
+# Extension: handling supplier spreadsheets and emails at scale
 
-Today a lot enters the system through one clean `POST /stock`. In reality it arrives as
-dozens of spreadsheets and emails a week, each supplier with its own column names, date
-formats, units and quirks. The design below turns that mess into the same validated rows,
+Right now a lot arrives through one clean `POST /stock`. In practice it will arrive as
+dozens of spreadsheets and emails a week, and every supplier has their own column names,
+date formats and units. The design below turns all of that into the same validated rows,
 without letting bad data reach the opportunity rule.
 
 ## 1. Pipeline shape
 
+Files come in from an email inbox (IMAP or SES), an SFTP drop, a shared drive or an API
+upload. They land in S3, get parsed, mapped and normalized, then move through staging,
+validation and deduplication before reaching `stock_items` in PostgreSQL. Anything doubtful
+branches off to a human review queue.
+
 ```
-Sources                Landing            Processing               Serving
-────────               ───────            ──────────               ───────
-email inbox   ──┐                  ┌─ parse ─┐
-SFTP drop     ──┼─▶ object store ──┼─ map ───┼─▶ staging ─▶ validate ─▶ dedupe ─▶ stock_items
-shared drive  ──┘   (raw, WORM)    └─ normalize                │
-API upload                                                     └─▶ review queue (humans)
+email / SFTP / drive / upload
+        |
+        v
+   S3 (raw, immutable)  ==>  parse, map, normalize  ==>  staging
+                                                            |
+                                    validate, dedupe  ==>  stock_items
+                                                            |
+                                                     review queue (people)
 ```
 
-Every file is stored **byte-for-byte first**, before anything parses it. The raw object is
-the source of truth; every later stage is reproducible from it, which is what makes
-reprocessing after a mapper bug fix a replay rather than a data-recovery exercise.
+The first thing that happens to a file is that it gets saved to S3 exactly as it arrived,
+before anything tries to read it. That raw copy is the source of truth, so when a mapping
+bug is found later, fixing it means replaying the files rather than trying to recover lost
+data.
+
+Concretely: keys are partitioned as `raw/supplier=<name>/dt=<date>/<ulid>-<filename>`,
+with versioning and Object Lock switched on so nothing can overwrite or delete a raw file,
+SSE-KMS encryption because supplier pricing is commercially sensitive, and lifecycle rules
+moving objects to Glacier after ninety days. S3 event notifications push straight onto SQS,
+so arrival triggers work instead of a polling loop. On premise, MinIO offers the same API
+and the same locking behaviour.
 
 ## 2. Normalization
 
-Per-supplier **mapping profiles**, stored as versioned config rows rather than code:
+Each supplier gets a mapping profile, stored as versioned config in the database rather
+than code. It says how to recognise their file and what each of their columns means:
 
 ```yaml
 supplier: acme_metals
@@ -30,135 +46,141 @@ match: { from: "*@acmemetals.com", subject: "Weekly stock*" }
 sheet: "Stock"
 header_row: 3
 columns:
-  supplier:       { const: "Acme Metals" }
   product_type:   { from: "Item Description", lookup: product_alias }
-  location:       { from: "Whse", lookup: location_alias }
   quantity:       { from: "Qty (MT)", unit: MT, to_unit: KG }
   purchase_price: { from: "Unit Cost", per_unit: true }
-  currency:       { from: "Cur", default: AED }
   received_date:  { from: "GRN Date", formats: ["%d/%m/%Y", "%d-%b-%y"] }
 ```
 
-Normalization steps, in order: decode and de-macro the file → locate the header row →
-apply the column map → coerce types (dates with an explicit format list, never a guessing
-parser; numbers with locale-aware thousand/decimal separators; negative-in-parentheses) →
-convert units and per-lot-to-per-unit prices → canonicalize entities through alias tables
-(`Cu Wire 2.5mm`, `COPPER WIRE 2.5`, `copper-wire-2.5mm` → one `product_type`) → trim,
-collapse whitespace, uppercase currency codes.
+The steps run in order: open the file (openpyxl for xlsx, pandas for csv, the stdlib
+`email` package plus a text extractor for messages and PDFs), find the header row, apply
+the column map, then convert the values. Dates are read against the list of formats we
+expect rather than a parser that guesses, numbers respect local thousand and decimal
+separators, and units and lot prices are converted to the ones we store. Product and
+location names are matched through alias tables, so `Cu Wire 2.5mm` and `COPPER WIRE 2.5`
+both end up as one product type.
 
-Alias tables are data, curated by humans, and are the single place fuzzy matching is
-allowed to write — after review.
+Those alias tables are data that people curate, and they are the only place fuzzy matching
+is ever allowed to write, after someone has reviewed it.
 
 ## 3. Validation
 
-Three tiers, each with a different consequence:
+Three levels, each handled differently:
 
-| Tier | Example | Consequence |
+| Level | Example | What happens |
 | --- | --- | --- |
-| Structural | file unreadable, no header row found, required column absent | reject file, alert |
-| Row-level | `quantity <= 0`, unknown currency, unparseable date, future `received_date` | quarantine row |
-| Plausibility | price 10× the trailing median for that product, quantity 100× the supplier's norm, duplicate of a lot received yesterday | accept but flag for review |
+| Structural | file unreadable, no header row | reject the file and alert |
+| Row | quantity of zero, unknown currency, date in the future | quarantine that row |
+| Plausibility | price ten times the usual median, quantity far above the supplier's norm | accept it but flag for review |
 
-The existing Pydantic schema is reused for tier 2, so the API and the pipeline can never
-disagree about what a valid lot is. Tier 3 never silently drops data — that is exactly the
-kind of row that is either a genuine bargain or a decimal-point error, and both need a human.
-A file is loaded transactionally: either the good rows land together with their batch record,
-or nothing does.
+Row checks reuse the same Pydantic schema the API uses, so the two can never disagree about
+what a valid lot looks like. Plausibility flags are never dropped quietly, because such a
+row is either a real bargain or a misplaced decimal point, and both need a person to look.
+Files load inside a single database transaction: either the good rows and their batch
+record all land, or nothing does.
 
 ## 4. Deduplication
 
-Suppliers resend the same week's file, forward the same email twice, and send corrections.
-Three layers:
+Suppliers resend the same file, forward the same email twice, and send corrections. Three
+layers catch that.
 
-1. **File level** — SHA-256 of the raw bytes. Same hash, already ingested → stop, log as
-   duplicate delivery.
-2. **Row level** — a deterministic natural key,
-   `hash(supplier_id, product_type, location, received_date, quantity, purchase_price, currency)`,
-   as a unique index on the staging table. Byte-identical rows resent in a different file
-   collapse onto the existing row.
-3. **Near-duplicate** — same supplier/product/date but different quantity or price is a
-   *correction candidate*, not a duplicate. It goes to review with both versions shown;
-   accepting one supersedes the other (the old row is marked superseded, never deleted).
+At file level we store the SHA-256 of the raw bytes, so a file we have already ingested
+stops immediately. At row level a natural key made of supplier, product, location, date,
+quantity, price and currency is a unique index on the staging table, so an identical row
+inside a different file merges into the one already there. And when the supplier, product
+and date match but the quantity or price has changed, that is a correction rather than a
+duplicate. It goes to review with both versions shown, and accepting one marks the other
+superseded instead of deleting it.
 
-Idempotency keys on the batch make a retried batch a no-op rather than a double load.
+Batches carry idempotency keys, so a retried batch does nothing rather than loading twice.
+This is the same natural key the API already uses to return `409` on a duplicate `POST`.
 
 ## 5. Background processing and retries
 
-A queue (Celery/RQ on Redis, or SQS with workers) with one job per stage, so a parse failure
-does not re-download and a validation failure does not re-parse:
+A queue runs one job per stage: fetch, parse, normalize, validate, load, index. Celery on
+Redis works, or SQS with plain worker processes if the rest of the stack is already on AWS.
+Splitting the stages means a validation failure does not force a re-download. Workers hold
+no state and can safely run twice, and jobs carry the S3 key and batch id rather than the
+file itself.
 
-`fetch → parse → normalize → validate → load → index`
-
-- Workers are stateless and idempotent; job payloads reference the raw object key and the
-  batch id, never file content.
-- Retries use exponential backoff with jitter, bounded attempts, and a **dead-letter queue**
-  for anything that exhausts them. Transient failures (network, DB timeout) retry; deterministic
-  failures (unparseable file) go straight to DLQ — retrying them is just noise.
-- Long files are chunked so one 200k-row workbook cannot block a worker or a queue.
-- Concurrency is capped per supplier so one large drop cannot starve the rest.
+Retries back off exponentially with jitter and give up after a set number of attempts,
+sending the job to a dead letter queue. Network blips and database timeouts are worth
+retrying; a file that cannot be parsed never will be, so it goes straight to the dead letter
+queue. Big files are processed in chunks so one huge workbook cannot block a worker, and
+each supplier has a concurrency cap so a large drop cannot crowd everyone else out.
 
 ## 6. Monitoring
 
-- **Pipeline metrics**: files received / parsed / failed per supplier, rows accepted,
-  quarantined, flagged; stage latency; queue depth; DLQ size; retry rate.
-- **Freshness / absence alerts**: a supplier who normally sends a file every Monday and does
-  not is a failure the pipeline will otherwise never report.
-- **Data-quality metrics**: share of rows needing alias resolution, share flagged as
-  implausible, drift in median price per product type — a jump usually means a mapping
-  broke, not that the market moved.
-- Structured logs carrying `batch_id` and `raw_object_key` on every line, traces across the
-  stages, and alerting on rates rather than single events (except DLQ arrivals and
-  structural rejections, which page immediately).
+We track files received, parsed and failed per supplier, rows accepted, quarantined and
+flagged, stage latency, queue depth, dead letter volume and retry rates, exported as
+Prometheus metrics and shown in Grafana.
+
+Just as important is noticing silence. A supplier who sends every Monday and suddenly does
+not is a failure nothing else will report, so absence gets its own alert.
+
+Data quality gets watched too: how many rows need alias resolution, how many look
+implausible, and whether the median price for a product type suddenly moves. A jump there
+usually means a mapping broke rather than that the market did something.
+
+Logs are structured JSON carrying the batch id and S3 key on every line, with OpenTelemetry
+traces spanning the stages. Alerts fire on rates rather than single events, except for dead
+letter arrivals and rejected files, which page straight away.
 
 ## 7. Data lineage
 
-Every served row can answer "where did this come from?":
+Every row we serve can explain where it came from.
 
-- `ingestion_batches` — raw object key, checksum, source (mailbox/SFTP/upload), sender,
-  received timestamp, mapping profile id **and version**, pipeline version, status.
-- `stock_items.batch_id`, `source_row_number`, and a `raw_payload` JSON snapshot of the
-  original row as it appeared before normalization.
-- `transformations` — the ordered list of what each stage changed for that row
-  (`"Qty (MT)" 12.5 → quantity 12500 KG`), so a wrong number is traceable to the rule that
-  produced it rather than to a guess.
-- Corrections are append-only with `superseded_by`, so history is reconstructible at any date.
+An `ingestion_batches` table records the S3 key, its checksum, who sent it, when, which
+mapping profile and version read it, and the pipeline version. Each stock row keeps its
+batch id, its row number in the original file, and a JSONB snapshot of how that row looked
+before normalization. A `transformations` record lists what each stage changed, for example
+`"Qty (MT)" 12.5` becoming `quantity 12500 KG`, so a wrong number can be traced to the rule
+that produced it instead of guessed at.
+
+Corrections only ever add rows, marking the old one superseded, so the history can be
+reconstructed for any date.
 
 ## 8. Human review
 
-A review queue is a first-class part of the pipeline, not a fallback:
+The review queue is part of the pipeline rather than a place things go wrong.
 
-- **What lands there**: unmapped products/locations, plausibility flags, correction
-  candidates, and anything an AI-assisted mapping proposed below a confidence threshold.
-- **What a reviewer sees**: the normalized row, the raw row beside it, the rendered source
-  file region, the reason it was flagged, and the peer statistics that made it look odd.
-- **Actions**: accept, correct, reject, or "accept and remember" — the last one writing an
-  alias or a mapping-profile change so the same file next week needs no review. The queue
-  should shrink per supplier over time; if it doesn't, the mapping is wrong.
-- Every decision is recorded with reviewer, timestamp and rationale, and feeds the accuracy
-  metrics for the mapping that produced it.
+Unmapped products and locations end up there, along with plausibility flags, correction
+candidates and any AI suggestion the model was not confident about. The reviewer sees the
+normalized row next to the raw one and the part of the file it came from, why it was
+flagged, and the comparable prices that made it look odd.
 
-## 9. Secure AI use
+They can accept, correct, reject, or accept and remember. That last option writes an alias
+or updates the mapping profile, so next week's file needs no review at all. Over time the
+queue for each supplier should shrink, and if it does not, the mapping is wrong. Every
+decision is stored with who made it, when and why, and feeds back into how well that
+mapping is performing.
 
-An LLM is genuinely good at the two hardest parts here — proposing a column mapping for a
-new supplier layout, and matching a messy product description to a canonical type — provided
-it stays inside these bounds:
+## 9. Using AI safely
 
-- **AI proposes, deterministic code applies.** The model outputs a *mapping profile* or an
-  *alias suggestion*, reviewed by a human once; the actual per-row transformation is executed
-  by ordinary code. Rows are never transformed by a model call, which keeps ingestion
-  reproducible, auditable and cheap.
-- **Minimize data exposure.** Send headers plus a handful of sample rows, not whole files;
-  redact contact details and commercial terms that the mapping task doesn't need. Prefer a
-  vendor with a no-training / zero-retention agreement, or a self-hosted model for
-  commercially sensitive pricing.
-- **Constrain the output.** Structured output against a strict schema, validated before use;
-  a model may only choose from existing canonical values or explicitly request a new one via
-  review. Anything it returns that isn't in the allowed set is rejected, not coerced.
-- **Treat supplier content as untrusted input.** Email bodies and spreadsheet cells can carry
-  prompt injection. Content goes into the prompt as clearly delimited data, the model has no
-  tools and no DB access, and its output can never be a command — only a proposal that the
-  schema and the reviewer gate.
-- **Confidence thresholds and fallbacks.** Below threshold → review queue. The pipeline must
-  work, more slowly, with the model switched off entirely.
-- **Log every call** (prompt hash, model, version, inputs referenced, output, confidence) as
-  part of lineage, so an AI-assisted decision is as auditable as a human one.
+An LLM is genuinely useful for the two hardest parts here: suggesting a column mapping for a
+supplier we have never seen, and matching a messy product description to one we already
+know. It stays inside these limits.
+
+The model proposes, ordinary code applies. It writes a mapping profile or an alias
+suggestion, a person approves it once, and after that deterministic code does the actual
+work on every row. No row is ever transformed by a model call, which keeps the whole thing
+reproducible, auditable and cheap.
+
+We send it as little as possible: column headers and a few sample rows rather than whole
+files, with anything the task does not need removed. For commercially sensitive pricing,
+either a vendor with a no training and no retention agreement, such as Bedrock or the
+Anthropic API with zero retention, or a model hosted in house.
+
+Its output is constrained to a strict JSON schema and validated with Pydantic before use. It
+can pick from values we already have or ask for a new one through review, and anything
+outside that is rejected rather than quietly corrected.
+
+Supplier content is treated as untrusted, because an email body or a spreadsheet cell can
+contain instructions aimed at the model. Content goes in as clearly marked data, the model
+has no tools and no database access, and its output can only ever be a suggestion that the
+schema and a reviewer approve.
+
+When confidence is low the item goes to review, and if the model is switched off entirely
+the pipeline still works, just more slowly. Every call is logged with the model, version,
+inputs, output and confidence, so an AI assisted decision can be audited exactly like a
+human one.
